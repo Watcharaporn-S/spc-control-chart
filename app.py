@@ -25,7 +25,6 @@ st.markdown("<h3 style='color: #0033A0; margin-bottom: 20px;'>📊 SPC - XBarR C
 
 # ==========================================
 # 🌟 0. ค่าคงที่ Xbar-R Chart ตามขนาดตัวอย่าง (n = 2..10)
-#     ที่มา: ตารางค่าคงที่มาตรฐานสำหรับ Control Chart (Montgomery, SPC)
 # ==========================================
 MAX_N = 10  # จำนวนคอลัมน์ค่าวัดสูงสุดที่รองรับ (x1..x10)
 
@@ -50,7 +49,7 @@ def get_constants(n):
 # ==========================================
 # 🌟 1. กำหนด Network Path และระบบ SQLite Database ส่วนกลาง
 # ==========================================
-NETWORK_PATH = r"Z:"  # เผื่อแมปเป็น Map Drive Z: หรือใช้ UNC Path เดิมก็ได้ครับ
+NETWORK_PATH = r"Z:"  
 ALT_PATH = r"\\pbpr0d\Ricoh Scan\S.Watcharaporn\00.Web App\spc_project"
 
 IS_NETWORK_STORAGE = False
@@ -68,22 +67,16 @@ else:
     excel_file = "master_data.xlsx"
     IS_NETWORK_STORAGE = False
 
-# หมายเหตุสำคัญ: SQLite WAL mode ใช้ shared-memory file (-wal / -shm) ซึ่ง "ไม่รองรับอย่างเป็นทางการ"
-# บน network filesystem (SMB/UNC/Mapped Drive) เพราะการล็อกไฟล์ผ่านเครือข่ายไม่รับประกันความถูกต้อง
-# -> ถ้าไฟล์ DB อยู่บน Network Path เราจะ "ไม่" เปิด WAL แต่จะใช้ journal mode ปกติ (DELETE)
-#    ร่วมกับ busy_timeout ที่นานขึ้น + retry logic แทน ซึ่งปลอดภัยกว่าสำหรับ multi-user บนเครือข่าย
-# ถ้ารันแบบ Local (ไม่มี network path) จะเปิด WAL mode ให้ เพื่อประสิทธิภาพการเขียน/อ่านพร้อมกันที่ดีขึ้น
-
-DB_BUSY_TIMEOUT_MS = 10000  # 10 วินาที ก่อนจะ error "database is locked"
+DB_BUSY_TIMEOUT_MS = 10000  # 10 วินาที
 DB_MAX_RETRY = 3
 
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE_PATH, timeout=DB_BUSY_TIMEOUT_MS / 1000, check_same_thread=False)
     conn.execute(f"PRAGMA busy_timeout = {DB_BUSY_TIMEOUT_MS};")
     if IS_NETWORK_STORAGE:
-        conn.execute("PRAGMA journal_mode = DELETE;")   # ปลอดภัยกว่าบน network share
+        conn.execute("PRAGMA journal_mode = DELETE;")
     else:
-        conn.execute("PRAGMA journal_mode = WAL;")      # เร็วกว่า เหมาะกับ local/local server เท่านั้น
+        conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA synchronous = NORMAL;")
 
     x_cols_def = ", ".join([f"x{i} REAL" for i in range(1, MAX_N + 1)])
@@ -104,7 +97,6 @@ def get_db_connection():
         )
     ''')
 
-    # เผื่อกรณีอัปเกรดจาก DB เวอร์ชันเก่าที่ยังไม่มีคอลัมน์ใหม่ -> เพิ่มคอลัมน์ให้อัตโนมัติ (migration แบบง่าย)
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(spc_records)").fetchall()}
     new_cols = {"year": "TEXT", "mc": "TEXT", "n": "INTEGER"}
     for i in range(1, MAX_N + 1):
@@ -116,7 +108,6 @@ def get_db_connection():
     return conn
 
 def _run_with_retry(fn):
-    """เรียกฟังก์ชันที่มีการเขียน DB พร้อม retry เมื่อเจอ 'database is locked' (สำคัญสำหรับ multi-user บน network drive)"""
     last_err = None
     for attempt in range(DB_MAX_RETRY):
         try:
@@ -153,7 +144,6 @@ def load_die_data_db(model_name, die_no):
         return pd.DataFrame(columns=cols)
 
 def save_single_record_db(model_name, die_no, dim, date_str, time_str, inspector, year_str, mc_str, values, action=""):
-    """values: list ของค่าวัด (ความยาวเท่ากับ n ของจุดวัดนี้) จะถูก pad ด้วย None จนครบ MAX_N คอลัมน์"""
     def _do():
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -170,6 +160,40 @@ def save_single_record_db(model_name, die_no, dim, date_str, time_str, inspector
         return _run_with_retry(_do)
     except Exception as e:
         st.error(f"เกิดข้อผิดพลาดในการบันทึกข้อมูล (ลองใหม่ {DB_MAX_RETRY} ครั้งแล้ว): {e}")
+        return False
+
+def update_records_db(df_edited):
+    """🌟 ฟังก์ชันอัปเดตข้อมูลที่มีการแก้ไขใน st.data_editor กลับลง SQLite Database"""
+    def _do():
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        for _, row in df_edited.iterrows():
+            record_id = row['id']
+            # แปลงค่า X1-X10
+            x_vals = [row[col] if pd.notna(row[col]) else None for col in X_COLS_DISPLAY]
+            
+            sql = f'''
+                UPDATE spc_records 
+                SET date=?, time=?, inspector=?, year=?, mc=?, action=?,
+                    x1=?, x2=?, x3=?, x4=?, x5=?, x6=?, x7=?, x8=?, x9=?, x10=?
+                WHERE id=?
+            '''
+            params = (
+                str(row['Date']), str(row['Time']), str(row['Inspector']), 
+                str(row['Year']), str(row['M/C']), str(row['Action']),
+                *x_vals, record_id
+            )
+            cursor.execute(sql, params)
+            
+        conn.commit()
+        conn.close()
+        return True
+        
+    try:
+        return _run_with_retry(_do)
+    except Exception as e:
+        st.error(f"เกิดข้อผิดพลาดในการบันทึกการแก้ไข: {e}")
         return False
 
 def delete_records_by_ids(id_list):
@@ -214,7 +238,6 @@ def load_master_data(file_path, modified_time):
             if model not in master_dict: master_dict[model] = {}
             if die_no not in master_dict[model]: master_dict[model][die_no] = {}
 
-            # อ่านค่า Sample size (n) จาก Excel; ถ้าไม่ใช่ตัวเลขที่ถูกต้อง (2-10) จะ fallback เป็น 3
             try:
                 raw_n = int(row['Sample size (n)'])
                 sample_n = raw_n if 2 <= raw_n <= MAX_N else 3
@@ -273,7 +296,7 @@ with col_sel3:
 info = MASTER_DATA[selected_model][selected_die][selected_dim]
 spec_max = info["USL"]
 spec_min = info["LSL"]
-sample_n = info["Sample size (n)"]  # 🌟 ขนาดตัวอย่างของจุดวัดนี้ (แปรผันตาม Master Data)
+sample_n = info["Sample size (n)"]
 A2, d2, D3, D4, sample_n = get_constants(sample_n)
 
 df_spc = load_die_data_db(selected_model, selected_die)
@@ -313,7 +336,6 @@ x_db_bar = r_bar = sigma = ucl_x = lcl_x = ucl_r = lcl_r = cp = cpu = cpl = cpk 
 
 if len(df_raw) > 0:
     df_raw[X_COLS_DISPLAY] = df_raw[X_COLS_DISPLAY].apply(pd.to_numeric, errors='coerce')
-    # 🌟 คำนวณ Xbar/R แบบแปรผันตามจำนวนค่าที่กรอกจริงต่อแถว (รองรับ n ที่ต่างกันในอดีต/ปัจจุบัน)
     df_raw['Xbar'] = df_raw[X_COLS_DISPLAY].mean(axis=1, skipna=True)
     df_raw['R'] = df_raw[X_COLS_DISPLAY].max(axis=1, skipna=True) - df_raw[X_COLS_DISPLAY].min(axis=1, skipna=True)
 
@@ -388,7 +410,6 @@ with tab1:
             f_insp = st.text_input("Inspector", value=st.session_state.last_inspector)
 
             st.write(f"Measurements (X1 - X{sample_n}) [{selected_model} (Die {selected_die}) : {selected_dim}]:")
-            # 🌟 สร้างช่องกรอกค่าวัดแบบไดนามิกตาม sample_n (สูงสุด 5 คอลัมน์ต่อแถว เพื่อไม่ให้แน่นเกินไป)
             values = []
             per_row = 5
             for row_start in range(0, sample_n, per_row):
@@ -461,12 +482,10 @@ with tab1:
 
             plt.tight_layout(pad=1.0)
 
-            # 🌟 แปลงภาพ matplotlib figure ให้เป็น byte buffer เพื่อทำปุ่มดาวน์โหลดรูปภาพ PNG
             img_buf = io.BytesIO()
             fig.savefig(img_buf, format='png', dpi=300, bbox_inches='tight')
             img_buf.seek(0)
 
-            # ปุ่มดาวน์โหลดรูปกราฟ
             st.download_button(
                 label="📷 ดาวน์โหลดรูปกราฟ (PNG)",
                 data=img_buf,
@@ -502,14 +521,23 @@ with tab2:
         height=350
     )
 
-    col_btn, _ = st.columns([1.5, 4])
-    with col_btn:
-        if st.button("🗑️ ยืนยันการลบแถวที่เลือก", type="primary", use_container_width=True):
+    # 🌟 ปุ่มบันทึกการแก้ไข และ ปุ่มลบแถวที่เลือก
+    col_save_btn, col_del_btn, _ = st.columns([1.5, 1.5, 3])
+    
+    with col_save_btn:
+        if st.button("💾 บันทึกการแก้ไขข้อมูล", type="primary", use_container_width=True):
+            if update_records_db(edited_df):
+                st.success("บันทึกการแก้ไขลง Database สำเร็จ!")
+                time.sleep(1)
+                st.rerun()
+
+    with col_del_btn:
+        if st.button("🗑️ ยืนยันการลบแถวที่เลือก", use_container_width=True):
             to_delete = edited_df[edited_df['🗑️ เลือกเพื่อลบ'] == True]
             if len(to_delete) > 0:
                 ids_to_del = to_delete['id'].tolist()
                 if delete_records_by_ids(ids_to_del):
-                    st.success("ลบข้อมูลออกจาก Network Database สำเร็จ!")
+                    st.success("ลบข้อมูลออกจาก Database สำเร็จ!")
                     time.sleep(1)
                     st.rerun()
 
@@ -517,7 +545,6 @@ with tab2:
     st.markdown("#### 📥 ดาวน์โหลดข้อมูล (Export Data)")
 
     if len(df_spc) > 0:
-        # 🌟 แปลงคอลัมน์ Date เป็น datetime เพื่อใช้กรองช่วงวันที่ (แถวที่ Date ว่าง/ผิดรูปแบบจะถูกตัดออกจากช่วงกรอง)
         df_spc_dates = pd.to_datetime(df_spc['Date'], errors='coerce')
         valid_dates = df_spc_dates.dropna()
 
